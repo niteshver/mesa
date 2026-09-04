@@ -54,7 +54,6 @@ class Model[A: Agent, S: Scenario](HasEmitters):
 
     Attributes:
         running: A boolean indicating if the model should continue running.
-        steps: the number of times `model.step()` has been called.
         time: the current simulation time.
         random: a seeded python.random number generator.
         rng: a seeded numpy.random.Generator
@@ -147,6 +146,9 @@ class Model[A: Agent, S: Scenario](HasEmitters):
         self._all_agents: _HardKeyAgentSet[A] = _HardKeyAgentSet(
             [], random=self.random
         )  # an agenset with all agents
+
+        # Internal callbacks invoked after agent lifecycle events
+        self._agent_removed_hooks: list[Callable[[A], None]] = []
 
         self.data_registry = DataRegistry()
 
@@ -293,6 +295,21 @@ class Model[A: Agent, S: Scenario](HasEmitters):
         self._all_agents.remove(agent)
 
         _mesa_logger.debug(f"deregistered agent with agent_id {agent.unique_id}")
+
+        for hook in self._agent_removed_hooks:
+            hook(agent)
+
+    def _register_agent_removed_hook(self, hook: Callable[[A], None]) -> None:
+        """Register an internal callback invoked after an agent is deregistered.
+
+        The hook receives the deregistered agent and runs synchronously at the
+        end of ``deregister_agent``, after the agent has left all agent sets.
+
+        Args:
+            hook: Callback taking the removed agent as its only argument.
+
+        """
+        self._agent_removed_hooks.append(hook)
 
     def run_model(self) -> None:
         """Run the model until the end condition is reached.

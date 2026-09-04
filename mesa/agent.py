@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from mesa.experimental.actions import Action
     from mesa.model import Model
 
-from mesa.agentset import AgentSet
+from mesa.agentset import AgentSet, _resolve_per_agent_values
 
 
 class Agent[M: Model]:
@@ -37,9 +37,10 @@ class Agent[M: Model]:
     """
 
     _datasets: ClassVar = set()
+    _repr_excluded_fields: ClassVar[set[str]] = {"model", "current_action", "unique_id"}
 
     def __init_subclass__(cls, **kwargs):
-        """Called when DatasetTrackedAgent is subclassed."""
+        """Called when Agent is subclassed, giving each subclass its own dataset set."""
         super().__init_subclass__(**kwargs)
         # Each subclass gets its own dataset set
         # we use strings on this to avoid memory leaks
@@ -127,6 +128,21 @@ class Agent[M: Model]:
         Returns:
             AgentSet containing the agents created.
 
+        Warning:
+            A list, tuple, ndarray, or pandas Series argument is treated as one
+            value per agent and must have length n; a length mismatch raises
+            ValueError. This is especially easy to hit with coordinate tuples:
+            create_agents(model, 2, pos=(10, 20)) does NOT give both agents
+            pos=(10, 20); it gives agent 0 pos=10 and agent 1 pos=20, since the
+            tuple's length (2) matches n (2).
+
+            To assign the same sequence value to every agent, broadcast it
+            explicitly as a length-n list of that value, e.g.:
+            create_agents(model, 2, pos=[(10, 20)] * 2)
+
+        Raises:
+            ValueError: If a sequence argument's length does not match n.
+
         """
         agents = []
 
@@ -135,22 +151,13 @@ class Agent[M: Model]:
                 agents.append(cls(model))
             return AgentSet(agents, random=model.random)
 
-        # Prepare positional argument iterators
-        arg_iters = []
-        for arg in args:
-            if isinstance(arg, (list, np.ndarray, tuple, pd.Series)) and len(arg) == n:
-                arg_iters.append(arg)
-            else:
-                arg_iters.append(itertools.repeat(arg, n))
+        # Prepare positional argument iterators. A sequence must have length n
+        # (assigned per agent); a length mismatch raises. Anything else is broadcast.
+        arg_iters = [_resolve_per_agent_values(arg, n) for arg in args]
 
         # Prepare keyword argument iterators
         kw_keys = list(kwargs.keys())
-        kw_val_iters = []
-        for v in kwargs.values():
-            if isinstance(v, (list, np.ndarray, tuple, pd.Series)) and len(v) == n:
-                kw_val_iters.append(v)
-            else:
-                kw_val_iters.append(itertools.repeat(v, n))
+        kw_val_iters = [_resolve_per_agent_values(v, n) for v in kwargs.values()]
 
         # If arg_iters is empty, zip(*[]) returns nothing, so we use repeat(())
         pos_iter = zip(*arg_iters) if arg_iters else itertools.repeat(())
@@ -205,6 +212,28 @@ class Agent[M: Model]:
 
         return AgentSet(agents, random=model.random)
 
+    def __str__(self) -> str:
+        """Return a human-readable string representation of the agent."""
+        return f"{self.__class__.__name__}, agent_id = {self.unique_id}"
+
+    def __repr__(self) -> str:
+        """Return an unambiguous string representation including agent state."""
+        # Get excluded fields (allows subclasses to override)
+        excluded = self._repr_excluded_fields
+
+        # Get user-defined attributes (exclude private and Mesa fields)
+        user_attrs = {
+            k: v
+            for k, v in self.__dict__.items()
+            if not k.startswith("_") and k not in excluded
+        }
+
+        if user_attrs:
+            attr_str = ", ".join(f"{k}={v!r}" for k, v in user_attrs.items())
+            return f"<{self.__class__.__name__} id={self.unique_id} {attr_str}>"
+        else:
+            return f"<{self.__class__.__name__} id={self.unique_id}>"
+
     @property
     def random(self) -> Random:
         """Return a seeded stdlib rng."""
@@ -226,6 +255,10 @@ class Agent[M: Model]:
 
         The action must be in PENDING or INTERRUPTED state and the agent
         must not be currently performing another action.
+
+        If one of the action's start requirements does not hold, the action moves
+        to FAILED instead of starting and the agent stays idle. Check
+        action.has_failed rather than assuming the action is running.
 
         Args:
             action: The Action to perform. Must have been created with
@@ -258,26 +291,58 @@ class Agent[M: Model]:
         # called _do_complete which cleared current_action via the Action.
         return action
 
+    def should_interrupt(self, current: Action, incoming: Action) -> bool:
+        """Decide whether an incoming action may preempt the current one.
+
+        Consulted by interrupt_for() whenever the agent is busy, with both
+        priorities already resolved. Override to encode preemption policy,
+        e.g. comparing action names or agent state instead of priorities.
+
+        Args:
+            current: The action the agent is performing.
+            incoming: The action that wants to replace it.
+
+        Returns:
+            True to attempt the interruption, False to refuse it.
+
+        Notes:
+            Returning True cannot override the interruptible flag; use
+            cancel_action() to force. This hook decides policy, the flag
+            stays a hard property of the action.
+        """
+        return current.interruptible and incoming.priority >= current.priority
+
     def interrupt_for(self, new_action: Action) -> bool:
         """Interrupt the current action and start a new one.
 
-        If there is no current action, simply starts the new one. If the
-        current action is non-interruptible, returns False and does nothing.
+        If there is no current action, simply starts the new one. Otherwise
+        should_interrupt(current, incoming) decides whether to preempt.
 
         Args:
             new_action: The Action to perform instead.
 
         Returns:
-            True if the new action was started (either no current action,
-            or the current one was successfully interrupted). False if the
-            current action is non-interruptible.
+            True if the new action was started. False if should_interrupt
+            refused, the current action is non-interruptible, or the new
+            action failed its start requirements.
+
+        Notes:
+            The False cases differ in what they leave behind. A refusal
+            changes nothing. A failed requirement does not roll the
+            interruption back: the old action is already INTERRUPTED and
+            the agent is left idle, since whether to resume it is the
+            model's decision.
         """
-        if self.current_action is not None and not self.current_action.interrupt():
-            return False
-            # interrupt() already cleared current_action
+        if self.current_action is not None:
+            new_action._resolve_priority()
+            if not self.should_interrupt(self.current_action, new_action):
+                return False
+            if not self.current_action.interrupt():
+                return False
+                # interrupt() already cleared current_action
 
         self.start_action(new_action)
-        return True
+        return not new_action.has_failed
 
     def cancel_action(self) -> bool:
         """Cancel the current action, ignoring interruptible flag.
